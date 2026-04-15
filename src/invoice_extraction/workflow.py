@@ -1,15 +1,18 @@
+import os
+from pathlib import Path
+from typing import Annotated
+
+from llama_cloud import AsyncLlamaCloud
+from llama_cloud.types.extraction.extract_config_param import ExtractConfigParam
 from pydantic import BaseModel, Field
-from workflows import Workflow, step, Context
+from workflows import Context, Workflow, step
 from workflows.events import (
+    HumanResponseEvent,
+    InputRequiredEvent,
     StartEvent,
     StopEvent,
-    InputRequiredEvent,
-    HumanResponseEvent,
 )
 from workflows.resource import Resource
-from typing import Annotated
-from llama_cloud_services import LlamaExtract
-from llama_cloud_services.extract import ExtractConfig, ExtractMode
 
 
 class InvoiceData(BaseModel):
@@ -26,8 +29,21 @@ class HumanFeedbackEvent(HumanResponseEvent):
     approved: bool
 
 
-async def get_invoice_extractor(*args, **kwargs):
-    return LlamaExtract()
+# required for all llama cloud calls
+LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
+# get this in case running against a different environment than production
+LLAMA_CLOUD_BASE_URL = os.getenv("LLAMA_CLOUD_BASE_URL")
+LLAMA_CLOUD_PROJECT_ID = os.getenv("LLAMA_DEPLOY_PROJECT_ID")
+
+
+async def get_llama_cloud_client(*args, **kwargs) -> AsyncLlamaCloud:
+    return AsyncLlamaCloud(
+        api_key=LLAMA_CLOUD_API_KEY,
+        base_url=LLAMA_CLOUD_BASE_URL,
+        default_headers={"Project-Id": LLAMA_CLOUD_PROJECT_ID}
+        if LLAMA_CLOUD_PROJECT_ID
+        else {},
+    )
 
 
 class InvoiceExtractWorkflow(Workflow):
@@ -36,64 +52,65 @@ class InvoiceExtractWorkflow(Workflow):
         self,
         ev: StartEvent,
         ctx: Context,
-        extractor: Annotated[LlamaExtract, Resource(get_invoice_extractor)],
+        client: Annotated[AsyncLlamaCloud, Resource(get_llama_cloud_client)],
     ) -> FeedbackRequiredEvent:
         async with ctx.store.edit_state() as state:
             state.extraction_mode = ev.extraction_mode
             state.path = ev.path
 
+        config: ExtractConfigParam
         if ev.extraction_mode == "base":
-            config = ExtractConfig(
-                extraction_mode=ExtractMode.FAST,
-                high_resolution_mode=False,  # Better OCR accuracy
-                invalidate_cache=False,  # Bypass cached results
-                cite_sources=False,  # Enable source citations
-                use_reasoning=False,  # Enable reasoning (not in FAST mode)
-                confidence_scores=False,  # MULTIMODAL/PREMIUM only
-            )
+            config = {
+                "extraction_mode": "FAST",
+                "high_resolution_mode": False,
+                "invalidate_cache": False,
+                "cite_sources": False,
+                "use_reasoning": False,
+                "confidence_scores": False,
+            }
         elif ev.extraction_mode == "advanced":
-            config = ExtractConfig(
-                extraction_mode=ExtractMode.MULTIMODAL,
-                high_resolution_mode=True,  # Better OCR accuracy
-                invalidate_cache=False,  # Bypass cached results
-                cite_sources=False,  # Enable source citations
-                use_reasoning=True,  # Enable reasoning (not in FAST mode)
-                confidence_scores=False,  # MULTIMODAL/PREMIUM only
-            )
+            config = {
+                "extraction_mode": "MULTIMODAL",
+                "high_resolution_mode": True,
+                "invalidate_cache": False,
+                "cite_sources": False,
+                "use_reasoning": True,
+                "confidence_scores": False,
+            }
         else:
-            config = ExtractConfig(
-                extraction_mode=ExtractMode.PREMIUM,
-                high_resolution_mode=True,  # Better OCR accuracy
-                invalidate_cache=False,  # Bypass cached results
-                cite_sources=True,  # Enable source citations
-                use_reasoning=True,  # Enable reasoning (not in FAST mode)
-                confidence_scores=True,  # MULTIMODAL/PREMIUM only
-            )
+            config = {
+                "extraction_mode": "PREMIUM",
+                "high_resolution_mode": True,
+                "invalidate_cache": False,
+                "cite_sources": True,
+                "use_reasoning": True,
+                "confidence_scores": True,
+            }
 
-        result = await extractor.aextract(
-            data_schema=InvoiceData, config=config, files=[ev.path]
+        uploaded = await client.files.create(
+            file=Path(ev.path).open("rb"),
+            purpose="extract",
+        )
+        result = await client.extraction.extract(
+            config=config,
+            data_schema=InvoiceData.model_json_schema(),
+            file_id=uploaded.id,
         )
         extracted_data: list[InvoiceData] = []
-        if isinstance(result, list):
-            for r in result:
-                extracted_data.append(InvoiceData.model_validate(r.data))
-        else:
+        if isinstance(result.data, list):
+            for r in result.data:
+                extracted_data.append(InvoiceData.model_validate(r))
+        elif result.data is not None:
             extracted_data.append(InvoiceData.model_validate(result.data))
-        async with ctx.store.edit_state() as state:
-            state.extraction_result = "\\n\\n---\\n\\n".join(
-                [
-                    f"Invoice Date: {d.invoice_date}\\nCustomer: {d.customer}\\nAmount Due: {d.amount_due}"
-                    for d in extracted_data
-                ]
-            )
-        return FeedbackRequiredEvent(
-            extraction_result="\\n\\n---\\n\\n".join(
-                [
-                    f"Invoice Date: {d.invoice_date}\\nCustomer: {d.customer}\\nAmount Due: {d.amount_due}"
-                    for d in extracted_data
-                ]
-            )
+        extraction_result = "\\n\\n---\\n\\n".join(
+            [
+                f"Invoice Date: {d.invoice_date}\\nCustomer: {d.customer}\\nAmount Due: {d.amount_due}"
+                for d in extracted_data
+            ]
         )
+        async with ctx.store.edit_state() as state:
+            state.extraction_result = extraction_result
+        return FeedbackRequiredEvent(extraction_result=extraction_result)
 
     @step
     async def human_feedback(
@@ -114,9 +131,9 @@ async def main(path: str, extraction_mode: str) -> None:
             print("Extraction Result:\\n\\n" + ev.extraction_result + "\\n\\n")
             res = input("Approve? [yes/no]: ")
             if res.lower().strip() == "yes":
-                handler.ctx.send_event(HumanFeedbackEvent(approved=True))  # type: ignore
+                handler.ctx.send_event(HumanFeedbackEvent(approved=True))
             else:
-                handler.ctx.send_event(HumanFeedbackEvent(approved=False))  # type: ignore
+                handler.ctx.send_event(HumanFeedbackEvent(approved=False))
     result = await handler
     print(str(result))
 
@@ -125,7 +142,6 @@ workflow = InvoiceExtractWorkflow(timeout=None)
 
 if __name__ == "__main__":
     import asyncio
-    import os
     from argparse import ArgumentParser
 
     parser = ArgumentParser()
