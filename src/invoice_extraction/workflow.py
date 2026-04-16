@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Annotated
 
 from llama_cloud import AsyncLlamaCloud
-from llama_cloud.types.extraction.extract_config_param import ExtractConfigParam
+from llama_cloud.types.extract_configuration_param import ExtractConfigurationParam
 from pydantic import BaseModel, Field
 from workflows import Context, Workflow, step
 from workflows.events import (
@@ -58,53 +58,38 @@ class InvoiceExtractWorkflow(Workflow):
             state.extraction_mode = ev.extraction_mode
             state.path = ev.path
 
-        config: ExtractConfigParam
+        configuration: ExtractConfigurationParam = {
+            "data_schema": InvoiceData.model_json_schema(),
+        }
         if ev.extraction_mode == "base":
-            config = {
-                "extraction_mode": "FAST",
-                "high_resolution_mode": False,
-                "invalidate_cache": False,
-                "cite_sources": False,
-                "use_reasoning": False,
-                "confidence_scores": False,
-            }
+            configuration["tier"] = "cost_effective"
         elif ev.extraction_mode == "advanced":
-            config = {
-                "extraction_mode": "MULTIMODAL",
-                "high_resolution_mode": True,
-                "invalidate_cache": False,
-                "cite_sources": False,
-                "use_reasoning": True,
-                "confidence_scores": False,
-            }
+            configuration["tier"] = "agentic"
         else:
-            config = {
-                "extraction_mode": "PREMIUM",
-                "high_resolution_mode": True,
-                "invalidate_cache": False,
-                "cite_sources": True,
-                "use_reasoning": True,
-                "confidence_scores": True,
-            }
+            configuration["tier"] = "agentic"
+            configuration["cite_sources"] = True
+            configuration["confidence_scores"] = True
 
-        uploaded = await client.files.create(
-            file=Path(ev.path).open("rb"),
-            purpose="extract",
+        with Path(ev.path).open("rb") as f:
+            uploaded = await client.files.create(file=f, purpose="extract")
+
+        extract_job = await client.extract.create(
+            file_input=uploaded.id,
+            configuration=configuration,
         )
-        result = await client.extraction.extract(
-            config=config,
-            data_schema=InvoiceData.model_json_schema(),
-            file_id=uploaded.id,
-        )
+        job = await client.extract.wait_for_completion(extract_job.id)
+
         extracted_data: list[InvoiceData] = []
-        if isinstance(result.data, list):
-            for r in result.data:
+        result = job.extract_result
+        if isinstance(result, list):
+            for r in result:
                 extracted_data.append(InvoiceData.model_validate(r))
-        elif result.data is not None:
-            extracted_data.append(InvoiceData.model_validate(result.data))
-        extraction_result = "\\n\\n---\\n\\n".join(
+        elif result is not None:
+            extracted_data.append(InvoiceData.model_validate(result))
+
+        extraction_result = "\n\n---\n\n".join(
             [
-                f"Invoice Date: {d.invoice_date}\\nCustomer: {d.customer}\\nAmount Due: {d.amount_due}"
+                f"Invoice Date: {d.invoice_date}\nCustomer: {d.customer}\nAmount Due: {d.amount_due}"
                 for d in extracted_data
             ]
         )
@@ -128,7 +113,7 @@ async def main(path: str, extraction_mode: str) -> None:
     handler = w.run(path=path, extraction_mode=extraction_mode)
     async for ev in handler.stream_events():
         if isinstance(ev, FeedbackRequiredEvent):
-            print("Extraction Result:\\n\\n" + ev.extraction_result + "\\n\\n")
+            print("Extraction Result:\n\n" + ev.extraction_result + "\n\n")
             res = input("Approve? [yes/no]: ")
             if res.lower().strip() == "yes":
                 handler.ctx.send_event(HumanFeedbackEvent(approved=True))
