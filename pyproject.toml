@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "invoice-extraction"
 version = "0.1.0"
 description = "A workflow that, given an invoice, extracts several key details using LlamaExtract"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 readme = "README.md"
 dependencies = [
   "llama-index-workflows>=2.16.0,<3.0.0",
@@ -18,9 +18,16 @@ dev = [
     "hatch>=1.14.2",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.3.0",
+    "pytest-timeout>=2.3.1",
+    "llama-cloud-fake>=0.1,<0.2",
     "ruff>=0.13.2",
     "ty>=0.0.2",
 ]
+
+[tool.pytest.ini_options]
+timeout = 120
+timeout_method = "thread"
+asyncio_mode = "auto"
 
 [tool.hatch.envs.default.scripts]
 format = "ruff format ."
